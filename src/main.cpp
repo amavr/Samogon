@@ -8,13 +8,16 @@
 BearSSL::CertStore certStore;
 
 #define ONE_WIRE_BUS 0
+#define ZOOMER_PIN 16
+
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 DeviceAddress sensor;
 int numberOfDevices = 0;
-int step = 2;
+int step = 1;
 float t = 0;
 float last_t = 0;
+uint64_t last_time = 0;
 bool ahtungSent = false;
 float maxT = 82.0;
 bool offSent = false;
@@ -36,10 +39,11 @@ WiFiClient wclient;
 #include <PubSubClient.h>
 
 WiFiClientSecure espClient;
-PubSubClient * cliMQTT;
+PubSubClient *cliMQTT;
 // PubSubClient cliMQTT(wclient);
 
 const char *MQTT_HOST = "d1ec7bc1e6514d2e8aff3f03c0b50c99.s2.eu.hivemq.cloud";
+// const char *MQTT_HOST = "a628ce9789bf4d97a2adaf5adb651916.s2.eu.hivemq.cloud";
 const uint16_t MQTT_PORT = 8883;
 
 struct TBotCfg
@@ -129,7 +133,8 @@ void onTlgMsg(FB_msg &msg)
             s.trim();
             maxT = s.toFloat();
             saveMaxT();
-            bot.sendMessage("Ахтунг при " + String(maxT) + "°");
+            cliMQTT->publish("tempAlert", s.c_str());
+            // bot.sendMessage("Ахтунг при " + s + "°");
         }
         else
         {
@@ -142,9 +147,10 @@ void onTlgMsg(FB_msg &msg)
         {
             String s = msg.text.substring(5);
             s.trim();
-            maxT = s.toFloat();
+            offT = s.toFloat();
             saveOffT();
-            bot.sendMessage("Выключение при " + String(offT) + "°");
+            cliMQTT->publish("tempOff", s.c_str());
+            // bot.sendMessage("Выключение при " + s + "°");
         }
         else
         {
@@ -193,14 +199,29 @@ void offElectro()
 
 void onMqttMsg(char *topic, byte *payload, unsigned int length)
 {
-    Serial.print("Message arrived [");
-    Serial.print(topic);
-    Serial.print("] ");
-    for (uint16_t i = 0; i < length; i++)
+    Serial.printf("Message arrived [%s]\n", topic);
+
+    char buf[length + 1];
+    buf[length] = '\0';
+    memcpy(buf, payload, length);
+    // for (uint16_t i = 0; i < length; i++)
+    // {
+    //     buf[i] = (char)payload[i];
+    // }
+    Serial.println(buf);
+
+    if (strcmp(topic, "tempAlert") == 0)
     {
-        Serial.print((char)payload[i]);
+        maxT = atof(buf);
+        saveMaxT();
+        // bot.sendMessage("Ахтунг при " + String(buf) + "°");
     }
-    Serial.println();
+    else if (strcmp(topic, "tempOff") == 0)
+    {
+        offT = atof(buf);
+        saveOffT();
+        // bot.sendMessage("Выключение при " + String(buf) + "°");
+    }
 }
 
 void reconnect()
@@ -210,6 +231,7 @@ void reconnect()
     {
         Serial.print("Attempting MQTT connection…");
         String clientId = "ESP8266Client";
+        clientId += String(random(0xffff), HEX);
         // Attempt to connect
         // Insert your password
         if (cliMQTT->connect(clientId.c_str(), "samogon", "sam0g0n$"))
@@ -218,7 +240,9 @@ void reconnect()
             // Once connected, publish an announcement…
             cliMQTT->publish("log", "connected");
             // … and resubscribe
-            cliMQTT->subscribe("action");
+            cliMQTT->subscribe("tempAlert");
+            cliMQTT->subscribe("tempCur");
+            cliMQTT->subscribe("tempOff");
         }
         else
         {
@@ -244,10 +268,14 @@ void toTime()
     strcpy(xtime, s.c_str());
 }
 
+bool isBeeped = false;
+uint32_t lastBeep;
+const uint32_t BEEP_MSEC = 300;
 void setup()
 {
     Serial.begin(115200); // Скорость передачи 115200
-    delay(1000);
+    Serial.flush();
+    // while(!Serial){}
 
     EEPROM.begin(sizeEEPROM);
     LittleFS.begin();
@@ -259,10 +287,13 @@ void setup()
     if (isFirstTime)
         reset();
 
+    pinMode(ZOOMER_PIN, OUTPUT);
+    digitalWrite(ZOOMER_PIN, 0);
     initSensor();
 
     // подключение к WiFi
     ctrl.connect(isFirstTime);
+    digitalWrite(ZOOMER_PIN, 1);
 
     if (isFirstTime)
     {
@@ -285,26 +316,13 @@ void setup()
     }
     beg_time = millis();
 
-    // int numCerts = certStore.initCertStore(LittleFS, PSTR("/certs.idx"), PSTR("/certs.ar"));
-    // Serial.printf("Number of CA certs read: %d\n", numCerts);
-    // if (numCerts == 0)
-    // {
-    //     Serial.printf("No certs found. Did you run certs-from-mozilla.py and upload the LittleFS directory before running?\n");
-    //     return; // Can't connect to anything w/o certs!
-    // }
-
-    // BearSSL::WiFiClientSecure *bear = new BearSSL::WiFiClientSecure();
-    // // Integrate the cert store with this connection
-    // bear->setCertStore(&certStore);
-    // cliMQTT = new PubSubClient(*bear);
-
-
-    espClient.setInsecure();    
+    espClient.setInsecure();
     cliMQTT = new PubSubClient(espClient);
 
     cliMQTT->setServer(MQTT_HOST, MQTT_PORT);
     cliMQTT->setCallback(onMqttMsg);
-    cliMQTT->subscribe("home/lamp1", 0);
+    last_time = millis();
+    lastBeep = last_time;
 }
 
 int n = 0;
@@ -323,12 +341,12 @@ void loop()
         String stemp = String(t);
         String s2 = String(offT) + "/" + String(step);
         toTime();
-        showInfo(stemp.c_str(), s2.c_str(), xtime);
+        // showInfo(stemp.c_str(), s2.c_str(), xtime);
 
         if (!offSent && t >= offT)
         {
             offElectro();
-            bot.sendMessage("Аппарат отключен!");
+            // bot.sendMessage("Аппарат отключен!");
             offSent = true;
         }
         else
@@ -336,21 +354,49 @@ void loop()
             offSent = false;
         }
 
-        if (!ahtungSent && t > maxT)
+        if (t > maxT)
         {
-            ahtungSent = true;
-            bot.sendMessage("Ахтунг! Температура " + String(t) + "°");
+            if (!ahtungSent)
+            {
+                ahtungSent = true;
+                bot.sendMessage("Ахтунг! Температура " + String(t) + "°");
+            }
+
+            if (millis() - lastBeep > BEEP_MSEC)
+            {
+                isBeeped = !isBeeped;
+                Serial.printf("isBeep [%s]\n", isBeeped ? "true" : "false");
+
+                // digitalWrite(ZOOMER_PIN, isBeeped ? 1 : 0);
+                lastBeep = millis();
+            }
         }
-        else if (t < maxT)
+        else
         {
             ahtungSent = false;
+            isBeeped = false;
+        }
+
+        if (isBeeped){
+            digitalWrite(ZOOMER_PIN, 1);
+        }
+        else{
+            digitalWrite(ZOOMER_PIN, 0);
         }
 
         if (abs(t - last_t) > step)
         {
             last_t = t;
-            bot.sendMessage("Сейчас: " + String(t) + "°");
+            // bot.sendMessage("Сейчас: " + String(t) + "°");
         }
+    }
+
+    if (millis() - last_time > 5000)
+    {
+        // char payload[50];
+        cliMQTT->publish("tempCur", String(t).c_str());
+        cliMQTT->publish("tempAlert", String(maxT, 1).c_str());
+        last_time = millis();
     }
 
     if (!cliMQTT->connected())
@@ -359,5 +405,5 @@ void loop()
     }
     cliMQTT->loop();
 
-    delay(10);
+    delay(100);
 }
