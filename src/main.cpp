@@ -9,6 +9,7 @@ BearSSL::CertStore certStore;
 
 #define ONE_WIRE_BUS 0
 #define ZOOMER_PIN 16
+#define RELAY_PIN D1
 
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
@@ -16,12 +17,17 @@ DeviceAddress sensor;
 int numberOfDevices = 0;
 int step = 1;
 float t = 0;
-float last_t = 0;
-uint64_t last_time = 0;
+
+float lastT = 0;
+float lastMax = 0;
+bool lastState = false;
+uint64_t lastTime = 0;
+
 bool ahtungSent = false;
 float maxT = 82.0;
 bool offSent = false;
 float offT = 100.0;
+bool stateOnOff = false;
 
 uint16_t sizeEEPROM = 512;
 uint64_t beg_time = 0;
@@ -189,12 +195,23 @@ void initSensor()
         // 28 79 55 81 E3 EE 3C 96
         sensors.requestTemperatures();
         t = sensors.getTempC(sensor);
-        last_t = t;
+        lastT = t;
     }
 }
 
-void offElectro()
+void turnOnOff(bool flag)
 {
+    if (flag)
+    {
+        digitalWrite(RELAY_PIN, 1);
+        stateOnOff = true;
+    }
+    else
+    {
+        digitalWrite(RELAY_PIN, 0);
+        stateOnOff = false;
+    }
+    cliMQTT->publish("state", stateOnOff ? "on" : "off");
 }
 
 void onMqttMsg(char *topic, byte *payload, unsigned int length)
@@ -222,6 +239,27 @@ void onMqttMsg(char *topic, byte *payload, unsigned int length)
         saveOffT();
         // bot.sendMessage("Выключение при " + String(buf) + "°");
     }
+    else if (strcmp(topic, "action") == 0)
+    {
+        if (strcmp(buf, "on") == 0)
+        {
+            turnOnOff(true);
+        }
+        else if (strcmp(buf, "off") == 0)
+        {
+            turnOnOff(false);
+        }
+    }
+    else if (strcmp(topic, "info") == 0)
+    {
+        if (strcmp(buf, "get") == 0)
+        {
+            cliMQTT->publish("state", stateOnOff ? "on" : "off");
+            cliMQTT->publish("tempCur", String(t, 1).c_str());
+            cliMQTT->publish("tempAlert", String(maxT, 1).c_str());
+            cliMQTT->publish("tempOff", String(offT, 1).c_str());
+        }
+    }
 }
 
 void reconnect()
@@ -243,6 +281,8 @@ void reconnect()
             cliMQTT->subscribe("tempAlert");
             cliMQTT->subscribe("tempCur");
             cliMQTT->subscribe("tempOff");
+            cliMQTT->subscribe("info");
+            cliMQTT->subscribe("action");
         }
         else
         {
@@ -271,6 +311,7 @@ void toTime()
 bool isBeeped = false;
 uint32_t lastBeep;
 const uint32_t BEEP_MSEC = 300;
+
 void setup()
 {
     Serial.begin(115200); // Скорость передачи 115200
@@ -288,7 +329,10 @@ void setup()
         reset();
 
     pinMode(ZOOMER_PIN, OUTPUT);
+    pinMode(RELAY_PIN, OUTPUT);
     digitalWrite(ZOOMER_PIN, 0);
+    digitalWrite(RELAY_PIN, 0);
+
     initSensor();
 
     // подключение к WiFi
@@ -321,8 +365,16 @@ void setup()
 
     cliMQTT->setServer(MQTT_HOST, MQTT_PORT);
     cliMQTT->setCallback(onMqttMsg);
-    last_time = millis();
-    lastBeep = last_time;
+    
+    lastTime = millis();
+    lastBeep = lastTime;
+    lastState = false;
+
+    cliMQTT->publish("state", stateOnOff ? "on" : "off");
+}
+
+float roundT(float tx){
+    return floor(tx * 10) / 10;
 }
 
 int n = 0;
@@ -337,17 +389,23 @@ void loop()
     {
         sensors.requestTemperatures();
         t = sensors.getTempC(sensor);
+        t = roundT(t);
 
         String stemp = String(t);
         String s2 = String(offT) + "/" + String(step);
         toTime();
         // showInfo(stemp.c_str(), s2.c_str(), xtime);
 
-        if (!offSent && t >= offT)
+        if (t >= offT)
         {
-            offElectro();
-            // bot.sendMessage("Аппарат отключен!");
-            offSent = true;
+            turnOnOff(false);
+            if (!offSent)
+            {
+                offSent = true;
+                String msgOff = "Аппарат отключен! Сейчас: " + String(t, 1) + "° Порог: " + String(offT, 1) + "°";
+                bot.sendMessage(msgOff);
+                cliMQTT->publish("msg", msgOff.c_str());
+            }
         }
         else
         {
@@ -358,14 +416,16 @@ void loop()
         {
             if (!ahtungSent)
             {
+                String msg = "Температура: " + String(t, 1) + "° Ахтунг: " + String(maxT, 1) + "°";
                 ahtungSent = true;
                 bot.sendMessage("Ахтунг! Температура " + String(t) + "°");
+                cliMQTT->publish("msg", msg.c_str());
             }
 
             if (millis() - lastBeep > BEEP_MSEC)
             {
                 isBeeped = !isBeeped;
-                Serial.printf("isBeep [%s]\n", isBeeped ? "true" : "false");
+                // Serial.printf("isBeep [%s]\n", isBeeped ? "true" : "false");
 
                 // digitalWrite(ZOOMER_PIN, isBeeped ? 1 : 0);
                 lastBeep = millis();
@@ -377,26 +437,41 @@ void loop()
             isBeeped = false;
         }
 
-        if (isBeeped){
+        if (isBeeped)
+        {
             digitalWrite(ZOOMER_PIN, 1);
         }
-        else{
+        else
+        {
             digitalWrite(ZOOMER_PIN, 0);
         }
 
-        if (abs(t - last_t) > step)
-        {
-            last_t = t;
-            // bot.sendMessage("Сейчас: " + String(t) + "°");
-        }
+        // if (abs(t - lastT) > step)
+        // {
+        //     lastT = t;
+        //     // bot.sendMessage("Сейчас: " + String(t) + "°");
+        // }
     }
 
-    if (millis() - last_time > 5000)
+    if (millis() - lastTime > 5000)
     {
-        // char payload[50];
-        cliMQTT->publish("tempCur", String(t).c_str());
-        cliMQTT->publish("tempAlert", String(maxT, 1).c_str());
-        last_time = millis();
+        if (lastT != t)
+        {
+            cliMQTT->publish("tempCur", String(t, 1).c_str());
+            lastT = t;
+        }
+        if (lastMax != maxT)
+        {
+            cliMQTT->publish("tempAlert", String(maxT, 1).c_str());
+            lastMax = maxT;
+        }
+        if (stateOnOff != lastState)
+        {
+            cliMQTT->publish("state", stateOnOff ? "on" : "off");
+            lastMax = maxT;
+        }
+
+        lastTime = millis();
     }
 
     if (!cliMQTT->connected())
